@@ -268,9 +268,10 @@ def LoadRecoveryFSTab(read_helper, fstab_version, type):
           else:
             print("%s: unknown option \"%s\"" % (mount_point, i))
 
-      d[mount_point] = Partition(mount_point=mount_point, fs_type=pieces[1],
-                                 device=pieces[2], length=length,
-                                 device2=device2)
+      if not d.get(mount_point):
+          d[mount_point] = Partition(mount_point=mount_point, fs_type=pieces[1],
+                                     device=pieces[2], length=length,
+                                     device2=device2)
 
   elif fstab_version == 2:
     d = {}
@@ -306,9 +307,10 @@ def LoadRecoveryFSTab(read_helper, fstab_version, type):
           context = i
 
       mount_point = pieces[1]
-      d[mount_point] = Partition(mount_point=mount_point, fs_type=pieces[2],
-                                 device=pieces[0], length=length,
-                                 device2=None, context=context)
+      if not d.get(mount_point):
+          d[mount_point] = Partition(mount_point=mount_point, fs_type=pieces[2],
+                                     device=pieces[0], length=length,
+                                     device2=None, context=context)
 
   else:
     raise ValueError("Unknown fstab_version: \"%d\"" % (fstab_version,))
@@ -336,6 +338,9 @@ def BuildBootableImage(sourcedir, fs_config_file, info_dict=None):
 
   ramdisk_img = tempfile.NamedTemporaryFile()
   img = tempfile.NamedTemporaryFile()
+  bootimg_key = os.getenv("PRODUCT_PRIVATE_KEY", None)
+  verity_key = os.getenv("PRODUCT_VERITY_KEY", None)
+  custom_boot_signer = os.getenv("PRODUCT_BOOT_SIGNER", None)
 
   if os.access(fs_config_file, os.F_OK):
     cmd = ["mkbootfs", "-f", fs_config_file, os.path.join(sourcedir, "RAMDISK")]
@@ -395,15 +400,16 @@ def BuildBootableImage(sourcedir, fs_config_file, info_dict=None):
       cmd.append("--ramdisk_offset")
       cmd.append(open(fn).read().rstrip("\n"))
 
-    fn = os.path.join(sourcedir, "dt_args")
+    fn = os.path.join(sourcedir, "dt")
     if os.access(fn, os.F_OK):
       cmd.append("--dt")
-      cmd.append(open(fn).read().rstrip("\n"))
+      cmd.append(fn)
 
     fn = os.path.join(sourcedir, "pagesize")
     if os.access(fn, os.F_OK):
+      kernel_pagesize=open(fn).read().rstrip("\n")
       cmd.append("--pagesize")
-      cmd.append(open(fn).read().rstrip("\n"))
+      cmd.append(kernel_pagesize)
 
     args = info_dict.get("mkbootimg_args", None)
     if args and args.strip():
@@ -423,6 +429,50 @@ def BuildBootableImage(sourcedir, fs_config_file, info_dict=None):
   assert p.returncode == 0, "mkbootimg of %s image failed" % (
       os.path.basename(sourcedir),)
 
+  if custom_boot_signer and bootimg_key and os.path.exists(bootimg_key):
+    print("Signing bootable image with custom boot signer...")
+    img_secure = tempfile.NamedTemporaryFile()
+    p = Run([custom_boot_signer, img.name, img_secure.name], stdout=subprocess.PIPE)
+    p.communicate()
+    assert p.returncode == 0, "signing of bootable image failed"
+    shutil.copyfile(img_secure.name, img.name)
+    img_secure.close()
+  elif bootimg_key and os.path.exists(bootimg_key) and kernel_pagesize > 0:
+    print("Signing bootable image...")
+    bootimg_key_passwords = {}
+    bootimg_key_passwords.update(PasswordManager().GetPasswords(bootimg_key.split()))
+    bootimg_key_password = bootimg_key_passwords[bootimg_key]
+    if bootimg_key_password is not None:
+        bootimg_key_password += "\n"
+    img_sha256 = tempfile.NamedTemporaryFile()
+    img_sig = tempfile.NamedTemporaryFile()
+    img_sig_padded = tempfile.NamedTemporaryFile()
+    img_secure = tempfile.NamedTemporaryFile()
+    p = Run(["openssl", "dgst", "-sha256", "-binary", "-out", img_sha256.name, img.name],
+        stdout=subprocess.PIPE)
+    p.communicate()
+    assert p.returncode == 0, "signing of bootable image failed"
+    p = Run(["openssl", "rsautl", "-sign", "-in", img_sha256.name, "-inkey", bootimg_key, "-out",
+        img_sig.name, "-passin", "stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    p.communicate(bootimg_key_password)
+    assert p.returncode == 0, "signing of bootable image failed"
+    p = Run(["dd", "if=/dev/zero", "of=%s" % img_sig_padded.name, "bs=%s" % kernel_pagesize,
+        "count=1"], stdout=subprocess.PIPE)
+    p.communicate()
+    assert p.returncode == 0, "signing of bootable image failed"
+    p = Run(["dd", "if=%s" % img_sig.name, "of=%s" % img_sig_padded.name, "conv=notrunc"],
+        stdout=subprocess.PIPE)
+    p.communicate()
+    assert p.returncode == 0, "signing of bootable image failed"
+    p = Run(["cat", img.name, img_sig_padded.name], stdout=img_secure.file.fileno())
+    p.communicate()
+    assert p.returncode == 0, "signing of bootable image failed"
+    shutil.copyfile(img_secure.name, img.name)
+    img_sha256.close()
+    img_sig.close()
+    img_sig_padded.close()
+    img_secure.close()
+
   if (info_dict.get("boot_signer", None) == "true" and
       info_dict.get("verity_key", None)):
     path = "/" + os.path.basename(sourcedir).lower()
@@ -431,8 +481,21 @@ def BuildBootableImage(sourcedir, fs_config_file, info_dict=None):
     cmd.extend([path, img.name,
                 info_dict["verity_key"] + ".pk8",
                 info_dict["verity_key"] + ".x509.pem", img.name])
-    p = Run(cmd, stdout=subprocess.PIPE)
-    p.communicate()
+    verity_key_password = None
+
+    if verity_key and os.path.exists(verity_key+".pk8") and kernel_pagesize > 0:
+      verity_key_passwords = {}
+      verity_key_passwords.update(PasswordManager().GetPasswords(verity_key.split()))
+      verity_key_password = verity_key_passwords[verity_key]
+
+    if verity_key_password is not None:
+      verity_key_password += "\n"
+      p = Run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+      p.communicate(verity_key_password)
+    else:
+      p = Run(cmd)
+      p.communicate()
+
     assert p.returncode == 0, "boot_signer of %s image failed" % path
 
   # Sign the image if vboot is non-empty.
@@ -1400,7 +1463,8 @@ PARTITION_TYPES = {
     "squashfs": "EMMC",
     "ext2": "EMMC",
     "ext3": "EMMC",
-    "vfat": "EMMC"
+    "vfat": "EMMC",
+    "osip": "OSIP"
 }
 
 def GetTypeAndDevice(mount_point, info):
@@ -1487,18 +1551,27 @@ fi
        'bonus_args': bonus_args}
 
   # The install script location moved from /system/etc to /system/bin
-  # in the L release.  Parse the init.rc file to find out where the
+  # in the L release.  Parse init.*.rc files to find out where the
   # target-files expects it to be, and put it there.
   sh_location = "etc/install-recovery.sh"
-  try:
-    with open(os.path.join(input_dir, "BOOT", "RAMDISK", "init.rc")) as f:
+  found = False
+  init_rc_dir = os.path.join(input_dir, "BOOT", "RAMDISK")
+  init_rc_files = os.listdir(init_rc_dir)
+  for init_rc_file in init_rc_files:
+    if (not init_rc_file.startswith('init.') or
+        not init_rc_file.endswith('.rc')):
+      continue
+
+    with open(os.path.join(init_rc_dir, init_rc_file)) as f:
       for line in f:
         m = re.match(r"^service flash_recovery /system/(\S+)\s*$", line)
         if m:
           sh_location = m.group(1)
-          print("putting script in", sh_location)
+          found = True
           break
-  except (OSError, IOError) as e:
-    print("failed to read init.rc: %s" % e)
+    if found:
+        break
+
+  print("putting script in", sh_location)
 
   output_sink(sh_location, sh)

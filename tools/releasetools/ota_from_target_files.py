@@ -637,13 +637,14 @@ else if get_stage("%(bcb_dev)s") == "3/3" then
   if HasVendorPartition(input_zip):
     system_progress -= 0.1
 
-  script.AppendExtra("if is_mounted(\"/data\") then")
-  script.ValidateSignatures("data")
-  script.AppendExtra("else")
-  script.Mount("/data")
-  script.ValidateSignatures("data")
-  script.Unmount("/data")
-  script.AppendExtra("endif;")
+  if not OPTIONS.wipe_user_data:
+    script.AppendExtra("if is_mounted(\"/data\") then")
+    script.ValidateSignatures("data")
+    script.AppendExtra("else")
+    script.Mount("/data")
+    script.ValidateSignatures("data")
+    script.Unmount("/data")
+    script.AppendExtra("endif;")
 
   if "selinux_fc" in OPTIONS.info_dict:
     WritePolicyConfig(OPTIONS.info_dict["selinux_fc"], output_zip)
@@ -830,7 +831,9 @@ def WriteBlockIncrementalOTAPackage(target_zip, source_zip, output_zip):
       source_zip=source_zip,
       source_version=source_version,
       target_zip=target_zip,
+      input_zip=target_zip,
       target_version=target_version,
+      input_version=target_version,
       output_zip=output_zip,
       script=script,
       metadata=metadata,
@@ -1235,7 +1238,9 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_zip):
       source_zip=source_zip,
       source_version=source_version,
       target_zip=target_zip,
+      input_zip=target_zip,
       target_version=target_version,
+      input_version=target_version,
       output_zip=output_zip,
       script=script,
       metadata=metadata,

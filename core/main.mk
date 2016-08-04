@@ -96,6 +96,9 @@ include $(BUILD_SYSTEM)/config.mk
 # CTS-specific config.
 -include cts/build/config.mk
 
+# CMTS-specific config.
+-include vendor/cmts/build/config.mk
+
 # This allows us to force a clean build - included after the config.mk
 # environment setup is done, but before we generate any dependencies.  This
 # file does the rm -rf inline so the deps which are all done below will
@@ -320,10 +323,18 @@ endif
 user_variant := $(filter user userdebug,$(TARGET_BUILD_VARIANT))
 enable_target_debugging := false
 tags_to_install :=
-# Target is secure in user builds.
-ADDITIONAL_DEFAULT_PROPERTIES += ro.secure=0
-# Pick up some extra useful tools
-tags_to_install += debug
+ifneq (,$(user_variant))
+  # Target is secure in user builds.
+  ADDITIONAL_DEFAULT_PROPERTIES += ro.secure=1
+  ADDITIONAL_DEFAULT_PROPERTIES += security.perf_harden=1
+
+  ifeq ($(user_variant),userdebug)
+    # Pick up some extra useful tools
+    tags_to_install += debug
+  else
+    # Disable debugging in plain user builds.
+    enable_target_debugging :=
+  endif
 
   # Turn on Dalvik preoptimization for user builds, but only if not
   # explicitly disabled and the build is running on Linux (since host
